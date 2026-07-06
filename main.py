@@ -3,10 +3,10 @@ Hand Gesture Volume Control
 Kontrol volume sistem Windows menggunakan gestur tangan via webcam.
 """
 
-import math
-
 import cv2
 import mediapipe as mp
+
+from src.gesture import VolumeMapper
 
 # MediaPipe Tasks API
 vision = mp.tasks.vision
@@ -40,6 +40,7 @@ def main():
         return
 
     detector = create_detector()
+    mapper = VolumeMapper()
     print("Webcam berhasil dibuka. Tekan 'q' untuk keluar.")
 
     while True:
@@ -60,6 +61,12 @@ def main():
         result = detector.detect_for_video(mp_image, int(cv2.getTickCount() / cv2.getTickFrequency() * 1000))
 
         if result.hand_landmarks:
+            # Status text hijau di pojok kanan atas
+            cv2.putText(
+                frame, "Hand Detected", (w - 200, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2,
+            )
+
             for hand_landmarks in result.hand_landmarks:
                 # Gambar landmark bawaan MediaPipe
                 DrawingUtils.draw_landmarks(
@@ -68,23 +75,28 @@ def main():
                     connections=HandConnections,
                 )
 
-                # Ambil koordinat ujung jempol & telunjuk
+                # Hitung jarak & volume
                 thumb = hand_landmarks[THUMB_TIP]
                 index = hand_landmarks[INDEX_TIP]
-
-                tx, ty = int(thumb.x * w), int(thumb.y * h)
-                ix, iy = int(index.x * w), int(index.y * h)
+                dist = mapper.get_distance(thumb, index, w, h)
+                volume = mapper.update(dist)
 
                 # Titik merah di ujung jari
+                tx, ty = int(thumb.x * w), int(thumb.y * h)
+                ix, iy = int(index.x * w), int(index.y * h)
                 cv2.circle(frame, (tx, ty), 8, (0, 0, 255), cv2.FILLED)
                 cv2.circle(frame, (ix, iy), 8, (0, 0, 255), cv2.FILLED)
 
                 # Garis penghubung
                 cv2.line(frame, (tx, ty), (ix, iy), (0, 0, 255), 2)
 
-                # Jarak Euclidean dalam pixel
-                dist = math.hypot(ix - tx, iy - ty)
-                print(f"Thumb-Index distance: {dist:.1f} px")
+                # Tampilkan volume di pojok kiri atas
+                cv2.putText(
+                    frame, f"Volume: {volume:.0f}%", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2,
+                )
+
+                print(f"Distance: {dist:.1f} px | Volume: {volume:.0f}%")
 
         cv2.imshow("Hand Gesture Volume Control", frame)
 
