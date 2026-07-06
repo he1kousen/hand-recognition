@@ -22,3 +22,9 @@ def get_current_volume() -> float:
     """Ambil volume sistem saat ini (0.0 - 1.0) → return sebagai persen 0-100."""
     vol = get_volume_interface()
     return vol.GetMasterVolumeLevelScalar() * 100
+
+
+def set_mute(muted: bool):
+    """Mute atau unmute volume sistem."""
+    vol = get_volume_interface()
+    vol.SetMute(muted, None)

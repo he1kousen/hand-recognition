@@ -1,24 +1,28 @@
 """
 Hand Gesture Volume Control
 Kontrol volume sistem Windows menggunakan gestur tangan via webcam.
+
+Gesture:
+  - Jempol + Telunjuk terbuka  → atur volume (jarak = level)
+  - Kepalan tangan (fist)      → mute/unmute
+  - Tekan 'q'                  → keluar
 """
+
+import argparse
+import sys
 
 import cv2
 import mediapipe as mp
 
-from src.audio_control import get_current_volume, set_volume_scalar
-from src.gesture import VolumeMapper
-from src.overlay import (
-    DirectionIndicator,
-    FPSCounter,
-    draw_custom_hand,
-    draw_volume_bar,
-    draw_volume_text,
-)
+from src.audio_control import get_current_volume, set_mute, set_volume_scalar
+from src.gesture import VolumeMapper, is_fist
+from src.overlay import StartupInstructions, draw_volume_bar
 
 # MediaPipe Tasks API
 vision = mp.tasks.vision
 BaseOptions = mp.tasks.BaseOptions
+DrawingUtils = vision.drawing_utils
+HandConnections = vision.HandLandmarksConnections.HAND_CONNECTIONS
 LipsIndices = set()
 for conn in vision.FaceLandmarksConnections.FACE_LANDMARKS_LIPS:
     LipsIndices.add(conn.start)
@@ -28,12 +32,15 @@ for conn in vision.FaceLandmarksConnections.FACE_LANDMARKS_LIPS:
 THUMB_TIP = 4
 INDEX_TIP = 8
 
+# Paths (relative supaya portable)
 MODEL_PATH = "assets/hand_landmarker.task"
 FACE_MODEL_PATH = "assets/face_landmarker.task"
 
 # Threshold: hanya update volume kalau selisih > 2%
 VOLUME_THRESHOLD = 2.0
 
+
+# ── Detector factories ──────────────────────────────
 
 def create_hand_detector():
     options = vision.HandLandmarkerOptions(
@@ -58,6 +65,8 @@ def create_face_detector():
     return vision.FaceLandmarker.create_from_options(options)
 
 
+# ── Helpers ─────────────────────────────────────────
+
 def blur_mouth(frame, face_landmarks, h, w):
     """Blur area sekitar mulut dari face landmarks."""
     xs, ys = [], []
@@ -81,99 +90,174 @@ def blur_mouth(frame, face_landmarks, h, w):
         frame[y1:y2, x1:x2] = blurred
 
 
+def draw_hand_landmarks(frame, hand_landmarks, thumb, index, w, h, dist, mapper):
+    """Gambar landmark, hitung volume, update sistem. Return (gesture_volume, muted_changed)."""
+    # Landmark bawaan MediaPipe
+    DrawingUtils.draw_landmarks(
+        image=frame,
+        landmark_list=hand_landmarks,
+        connections=HandConnections,
+    )
+
+    # Titik merah di ujung jari
+    tx, ty = int(thumb.x * w), int(thumb.y * h)
+    ix, iy = int(index.x * w), int(index.y * h)
+    cv2.circle(frame, (tx, ty), 8, (0, 0, 255), cv2.FILLED)
+    cv2.circle(frame, (ix, iy), 8, (0, 0, 255), cv2.FILLED)
+    cv2.line(frame, (tx, ty), (ix, iy), (0, 0, 255), 2)
+
+    return mapper.update(dist)
+
+
+def draw_info(frame, gesture_volume, sys_volume, dist, muted):
+    """Tampilkan info di pojok kiri atas."""
+    cv2.putText(
+        frame, f"Volume: {gesture_volume:.0f}%", (10, 30),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2,
+    )
+    cv2.putText(
+        frame, f"System: {sys_volume:.0f}%", (10, 65),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2,
+    )
+    cv2.putText(
+        frame, f"Dist: {dist:.0f}px", (10, 100),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1,
+    )
+    if muted:
+        cv2.putText(
+            frame, "MUTED", (10, 135),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2,
+        )
+
+
+# ── Argument parsing ────────────────────────────────
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Hand Gesture Volume Control")
+    parser.add_argument(
+        "--camera", "-c", type=int, default=0,
+        help="Index webcam (default: 0)",
+    )
+    parser.add_argument(
+        "--mute-feedback", action="store_true",
+        help="Matikan audio feedback beep",
+    )
+    return parser.parse_args()
+
+
+# ── Main ────────────────────────────────────────────
+
 def main():
-    cap = cv2.VideoCapture(0)
+    args = parse_args()
+
+    cap = cv2.VideoCapture(args.camera)
     if not cap.isOpened():
-        print("Error: Tidak bisa membuka webcam.")
-        return
+        print(f"Error: Tidak bisa membuka webcam index {args.camera}.")
+        return 1
 
-    hand_detector = create_hand_detector()
-    face_detector = create_face_detector()
-    mapper = VolumeMapper()
-    direction = DirectionIndicator()
-    fps_counter = FPSCounter()
+    hand_detector = None
+    face_detector = None
 
-    last_set_volume = get_current_volume()
-    print(f"Volume awal sistem: {last_set_volume:.0f}%")
-    print("Webcam berhasil dibuka. Tekan 'q' untuk keluar.")
+    try:
+        hand_detector = create_hand_detector()
+        face_detector = create_face_detector()
+        mapper = VolumeMapper()
+        instructions = StartupInstructions()
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            print("Error: Gagal membaca frame.")
-            break
+        last_set_volume = get_current_volume()
+        muted = False
+        fist_cooldown = 0  # frame counter supaya fist trigger tidak spam
 
-        frame = cv2.flip(frame, 1)
-        h, w, _ = frame.shape
+        print(f"Volume awal sistem: {last_set_volume:.0f}%")
+        print("Webcam berhasil dibuka. Tekan 'q' untuk keluar.")
 
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-        timestamp = int(cv2.getTickCount() / cv2.getTickFrequency() * 1000)
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                print("Error: Gagal membaca frame dari webcam.")
+                break
 
-        # Deteksi wajah → blur mulut
-        face_result = face_detector.detect_for_video(mp_image, timestamp)
-        if face_result.face_landmarks:
-            for face_lm in face_result.face_landmarks:
-                blur_mouth(frame, face_lm, h, w)
+            frame = cv2.flip(frame, 1)
+            h, w, _ = frame.shape
 
-        # Deteksi tangan
-        hand_result = hand_detector.detect_for_video(mp_image, timestamp)
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            timestamp = int(cv2.getTickCount() / cv2.getTickFrequency() * 1000)
 
-        if hand_result.hand_landmarks:
-            cv2.putText(
-                frame, "Hand Detected", (w - 200, 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2,
-            )
+            # Deteksi wajah → blur mulut
+            face_result = face_detector.detect_for_video(mp_image, timestamp)
+            if face_result.face_landmarks:
+                for face_lm in face_result.face_landmarks:
+                    blur_mouth(frame, face_lm, h, w)
 
-            for hand_landmarks in hand_result.hand_landmarks:
-                thumb = hand_landmarks[THUMB_TIP]
-                index = hand_landmarks[INDEX_TIP]
-                dist = mapper.get_distance(thumb, index, w, h)
-                gesture_volume = mapper.update(dist)
+            # Deteksi tangan
+            hand_result = hand_detector.detect_for_video(mp_image, timestamp)
 
-                # Trigger direction indicator
-                if abs(gesture_volume - last_set_volume) > VOLUME_THRESHOLD:
-                    if gesture_volume > last_set_volume:
-                        direction.trigger("up")
-                    elif gesture_volume < last_set_volume:
-                        direction.trigger("down")
-                    set_volume_scalar(gesture_volume / 100.0)
-                    last_set_volume = gesture_volume
+            if hand_result.hand_landmarks:
+                # Sembunyikan instruksi saat tangan pertama kali terdeteksi
+                instructions.dismiss()
 
-                # Custom hand landmarks (cyan dots, white line, scaling circle)
-                draw_custom_hand(frame, thumb, index, w, h, dist)
-
-                # Volume text besar dengan outline
-                draw_volume_text(frame, f"{gesture_volume:.0f}%", 10, 45)
-
-                # Distance kecil di bawah volume text
                 cv2.putText(
-                    frame, f"Dist: {dist:.0f}px", (10, 80),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1,
+                    frame, "Hand Detected", (w - 200, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2,
                 )
 
-                print(f"Distance: {dist:.1f} px | Gesture: {gesture_volume:.0f}%")
+                for hand_landmarks in hand_result.hand_landmarks:
+                    thumb = hand_landmarks[THUMB_TIP]
+                    index = hand_landmarks[INDEX_TIP]
 
-        # Volume bar vertikal di kanan (selalu tampil)
-        draw_volume_bar(frame, last_set_volume)
+                    # Cek fist → mute/unmute
+                    if is_fist(hand_landmarks, w, h):
+                        if fist_cooldown == 0:
+                            muted = not muted
+                            set_mute(muted)
+                            fist_cooldown = 15  # cooldown ~15 frame
+                        cv2.putText(
+                            frame, "Fist Detected", (w - 200, 60),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2,
+                        )
+                    else:
+                        # Atur volume dari gesture
+                        dist = mapper.get_distance(thumb, index, w, h)
+                        gesture_volume = draw_hand_landmarks(
+                            frame, hand_landmarks, thumb, index, w, h, dist, mapper,
+                        )
 
-        # Direction indicator (UP/DOWN)
-        direction.draw(frame, x=10, y=120)
+                        if not muted and abs(gesture_volume - last_set_volume) > VOLUME_THRESHOLD:
+                            set_volume_scalar(gesture_volume / 100.0)
+                            last_set_volume = gesture_volume
 
-        # FPS counter
-        fps_counter.update()
-        fps_counter.draw(frame)
+                        sys_volume = get_current_volume()
+                        draw_info(frame, gesture_volume, sys_volume, dist, muted)
 
-        cv2.imshow("Hand Gesture Volume Control", frame)
+            # Cooldown counter
+            if fist_cooldown > 0:
+                fist_cooldown -= 1
 
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            break
+            # Instruksi startup
+            instructions.draw(frame)
 
-    hand_detector.close()
-    face_detector.close()
-    cap.release()
-    cv2.destroyAllWindows()
+            # Volume bar vertikal di kanan
+            draw_volume_bar(frame, last_set_volume)
+
+            cv2.imshow("Hand Gesture Volume Control", frame)
+
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
+
+    except Exception as e:
+        print(f"Error: {e}")
+        return 1
+    finally:
+        if hand_detector is not None:
+            hand_detector.close()
+        if face_detector is not None:
+            face_detector.close()
+        cap.release()
+        cv2.destroyAllWindows()
+
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
