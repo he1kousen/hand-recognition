@@ -6,6 +6,7 @@ Kontrol volume sistem Windows menggunakan gestur tangan via webcam.
 import cv2
 import mediapipe as mp
 
+from src.audio_control import get_current_volume, set_volume_scalar
 from src.gesture import VolumeMapper
 
 # MediaPipe Tasks API
@@ -24,6 +25,9 @@ INDEX_TIP = 8
 
 MODEL_PATH = "assets/hand_landmarker.task"
 FACE_MODEL_PATH = "assets/face_landmarker.task"
+
+# Threshold: hanya update volume kalau selisih > 2%
+VOLUME_THRESHOLD = 2.0
 
 
 def create_hand_detector():
@@ -83,6 +87,10 @@ def main():
     hand_detector = create_hand_detector()
     face_detector = create_face_detector()
     mapper = VolumeMapper()
+
+    # Volume awal dari sistem
+    last_set_volume = get_current_volume()
+    print(f"Volume awal sistem: {last_set_volume:.0f}%")
     print("Webcam berhasil dibuka. Tekan 'q' untuk keluar.")
 
     while True:
@@ -124,11 +132,16 @@ def main():
                     connections=HandConnections,
                 )
 
-                # Hitung jarak & volume
+                # Hitung jarak & volume dari gesture
                 thumb = hand_landmarks[THUMB_TIP]
                 index = hand_landmarks[INDEX_TIP]
                 dist = mapper.get_distance(thumb, index, w, h)
-                volume = mapper.update(dist)
+                gesture_volume = mapper.update(dist)
+
+                # Update volume sistem hanya jika selisih > threshold
+                if abs(gesture_volume - last_set_volume) > VOLUME_THRESHOLD:
+                    set_volume_scalar(gesture_volume / 100.0)
+                    last_set_volume = gesture_volume
 
                 # Titik merah di ujung jari
                 tx, ty = int(thumb.x * w), int(thumb.y * h)
@@ -139,17 +152,24 @@ def main():
                 # Garis penghubung
                 cv2.line(frame, (tx, ty), (ix, iy), (0, 0, 255), 2)
 
-                # Tampilkan volume & distance di pojok kiri atas (merah)
+                # Volume aktual dari sistem (untuk debug)
+                sys_volume = get_current_volume()
+
+                # Tampilkan di pojok kiri atas (merah)
                 cv2.putText(
-                    frame, f"Volume: {volume:.0f}%", (10, 30),
+                    frame, f"Gesture: {gesture_volume:.0f}%", (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2,
                 )
                 cv2.putText(
-                    frame, f"Distance: {dist:.0f}px", (10, 65),
+                    frame, f"System:  {sys_volume:.0f}%", (10, 65),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2,
+                )
+                cv2.putText(
+                    frame, f"Distance: {dist:.0f}px", (10, 100),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2,
                 )
 
-                print(f"Distance: {dist:.1f} px | Volume: {volume:.0f}%")
+                print(f"Distance: {dist:.1f} px | Gesture: {gesture_volume:.0f}% | System: {sys_volume:.0f}%")
 
         cv2.imshow("Hand Gesture Volume Control", frame)
 
