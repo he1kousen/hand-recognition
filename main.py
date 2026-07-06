@@ -90,9 +90,13 @@ def main():
                 # Garis penghubung
                 cv2.line(frame, (tx, ty), (ix, iy), (0, 0, 255), 2)
 
-                # Tampilkan volume di pojok kiri atas
+                # Tampilkan volume & distance di pojok kiri atas
                 cv2.putText(
                     frame, f"Volume: {volume:.0f}%", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2,
+                )
+                cv2.putText(
+                    frame, f"Distance: {dist:.0f}px", (10, 65),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2,
                 )
 
